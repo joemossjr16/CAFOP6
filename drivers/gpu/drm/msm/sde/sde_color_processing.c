@@ -1,4 +1,4 @@
-/* Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 as published by
@@ -25,6 +25,7 @@
 #include "sde_hw_interrupts.h"
 #include "sde_core_irq.h"
 #include "dsi_panel.h"
+#include "sde_hw_color_processing.h"
 
 struct sde_cp_node {
 	u32 property_id;
@@ -69,6 +70,8 @@ static void dspp_igc_install_property(struct drm_crtc *crtc);
 
 static void dspp_hist_install_property(struct drm_crtc *crtc);
 
+static void dspp_dither_install_property(struct drm_crtc *crtc);
+
 typedef void (*dspp_prop_install_func_t)(struct drm_crtc *crtc);
 
 static dspp_prop_install_func_t dspp_prop_install_func[SDE_DSPP_MAX];
@@ -98,6 +101,7 @@ do { \
 	func[SDE_DSPP_GC] = dspp_gc_install_property; \
 	func[SDE_DSPP_IGC] = dspp_igc_install_property; \
 	func[SDE_DSPP_HIST] = dspp_hist_install_property; \
+	func[SDE_DSPP_DITHER] = dspp_dither_install_property; \
 } while (0)
 
 typedef void (*lm_prop_install_func_t)(struct drm_crtc *crtc);
@@ -133,6 +137,7 @@ enum {
 	SDE_CP_CRTC_DSPP_AD_INPUT,
 	SDE_CP_CRTC_DSPP_AD_ASSERTIVENESS,
 	SDE_CP_CRTC_DSPP_AD_BACKLIGHT,
+	SDE_CP_CRTC_DSPP_AD_STRENGTH,
 	SDE_CP_CRTC_DSPP_MAX,
 	/* DSPP features end */
 
@@ -142,6 +147,24 @@ enum {
 	/* LM feature end*/
 
 	SDE_CP_CRTC_MAX_FEATURES,
+};
+
+#define HIGH_BUS_VOTE_NEEDED(feature) ((feature == SDE_CP_CRTC_DSPP_IGC) |\
+				 (feature == SDE_CP_CRTC_DSPP_GC) |\
+				 (feature == SDE_CP_CRTC_DSPP_SIXZONE) |\
+				 (feature == SDE_CP_CRTC_DSPP_GAMUT))
+
+static u32 crtc_feature_map[SDE_CP_CRTC_MAX_FEATURES] = {
+	[SDE_CP_CRTC_DSPP_IGC] = SDE_DSPP_IGC,
+	[SDE_CP_CRTC_DSPP_PCC] = SDE_DSPP_PCC,
+	[SDE_CP_CRTC_DSPP_GC] = SDE_DSPP_GC,
+	[SDE_CP_CRTC_DSPP_MEMCOL_SKIN] = SDE_DSPP_MEMCOLOR,
+	[SDE_CP_CRTC_DSPP_MEMCOL_SKY] = SDE_DSPP_MEMCOLOR,
+	[SDE_CP_CRTC_DSPP_MEMCOL_FOLIAGE] = SDE_DSPP_MEMCOLOR,
+	[SDE_CP_CRTC_DSPP_SIXZONE] = SDE_DSPP_SIXZONE,
+	[SDE_CP_CRTC_DSPP_GAMUT] = SDE_DSPP_GAMUT,
+	[SDE_CP_CRTC_DSPP_DITHER] = SDE_DSPP_DITHER,
+	[SDE_CP_CRTC_DSPP_VLUT] = SDE_DSPP_VLUT,
 };
 
 #define INIT_PROP_ATTACH(p, crtc, prop, node, feature, val) \
@@ -734,6 +757,13 @@ static void sde_cp_crtc_setfeature(struct sde_cp_node *prop_node,
 			}
 			hw_lm->ops.setup_gc(hw_lm, &hw_cfg);
 			break;
+		case SDE_CP_CRTC_DSPP_DITHER:
+			if (!hw_dspp || !hw_dspp->ops.setup_pa_dither) {
+				ret = -EINVAL;
+				continue;
+			}
+			hw_dspp->ops.setup_pa_dither(hw_dspp, &hw_cfg);
+			break;
 		case SDE_CP_CRTC_DSPP_HIST_CTRL:
 			if (!hw_dspp || !hw_dspp->ops.setup_histogram) {
 				ret = -EINVAL;
@@ -803,6 +833,15 @@ static void sde_cp_crtc_setfeature(struct sde_cp_node *prop_node,
 			ad_cfg.hw_cfg = &hw_cfg;
 			hw_dspp->ops.setup_ad(hw_dspp, &ad_cfg);
 			break;
+		case SDE_CP_CRTC_DSPP_AD_STRENGTH:
+			if (!hw_dspp || !hw_dspp->ops.setup_ad) {
+				ret = -EINVAL;
+				continue;
+			}
+			ad_cfg.prop = AD_STRENGTH;
+			ad_cfg.hw_cfg = &hw_cfg;
+			hw_dspp->ops.setup_ad(hw_dspp, &ad_cfg);
+			break;
 		default:
 			ret = -EINVAL;
 			break;
@@ -837,6 +876,10 @@ void sde_cp_crtc_apply_properties(struct drm_crtc *crtc)
 	struct sde_hw_ctl *ctl;
 	uint32_t flush_mask = 0;
 	u32 num_mixers = 0, i = 0;
+	u32 sde_dspp_feature = SDE_DSPP_MAX;
+	struct msm_drm_private *priv = NULL;
+	struct sde_kms *sde_kms = NULL;
+	bool mdss_bus_vote = false;
 
 	if (!crtc || !crtc->dev) {
 		DRM_ERROR("invalid crtc %pK dev %pK\n", crtc,
@@ -853,6 +896,17 @@ void sde_cp_crtc_apply_properties(struct drm_crtc *crtc)
 	num_mixers = sde_crtc->num_mixers;
 	if (!num_mixers) {
 		DRM_DEBUG_DRIVER("no mixers for this crtc\n");
+		return;
+	}
+
+	priv = crtc->dev->dev_private;
+	if (!priv || !priv->kms) {
+		SDE_ERROR("invalid kms\n");
+		return;
+	}
+	sde_kms = to_sde_kms(priv->kms);
+	if (!sde_kms) {
+		SDE_ERROR("invalid sde kms\n");
 		return;
 	}
 
@@ -874,12 +928,28 @@ void sde_cp_crtc_apply_properties(struct drm_crtc *crtc)
 
 	list_for_each_entry_safe(prop_node, n, &sde_crtc->dirty_list,
 				dirty_list) {
+		sde_dspp_feature = crtc_feature_map[prop_node->feature];
+		if (!mdss_bus_vote && HIGH_BUS_VOTE_NEEDED(prop_node->feature)
+			&& !reg_dmav1_dspp_feature_support(sde_dspp_feature)) {
+			sde_power_scale_reg_bus(&priv->phandle,
+				sde_kms->core_client,
+				VOTE_INDEX_HIGH, false);
+			pr_debug("Vote HIGH for data bus: feature %d\n",
+					prop_node->feature);
+			mdss_bus_vote = true;
+		}
 		sde_cp_crtc_setfeature(prop_node, sde_crtc);
 		/* Set the flush flag to true */
 		if (prop_node->is_dspp_feature)
 			set_dspp_flush = true;
 		else
 			set_lm_flush = true;
+	}
+	if (mdss_bus_vote) {
+		sde_power_scale_reg_bus(&priv->phandle, sde_kms->core_client,
+			VOTE_INDEX_LOW, false);
+		pr_debug("Vote LOW for data bus\n");
+		mdss_bus_vote = false;
 	}
 
 	list_for_each_entry_safe(prop_node, n, &sde_crtc->ad_dirty,
@@ -1363,6 +1433,9 @@ static void dspp_ad_install_property(struct drm_crtc *crtc)
 		sde_cp_crtc_install_range_property(crtc,
 			"SDE_DSPP_AD_V4_ASSERTIVENESS",
 			SDE_CP_CRTC_DSPP_AD_ASSERTIVENESS, 0, (BIT(8) - 1), 0);
+		sde_cp_crtc_install_range_property(crtc,
+			"SDE_DSPP_AD_V4_STRENGTH",
+			SDE_CP_CRTC_DSPP_AD_STRENGTH, 0, (BIT(10) - 1), 0);
 		sde_cp_crtc_install_range_property(crtc, "SDE_DSPP_AD_V4_INPUT",
 			SDE_CP_CRTC_DSPP_AD_INPUT, 0, U16_MAX, 0);
 		sde_cp_crtc_install_range_property(crtc,
@@ -1496,6 +1569,31 @@ static void dspp_hist_install_property(struct drm_crtc *crtc)
 	}
 }
 
+static void dspp_dither_install_property(struct drm_crtc *crtc)
+{
+	char feature_name[256];
+	struct sde_kms *kms = NULL;
+	struct sde_mdss_cfg *catalog = NULL;
+	u32 version;
+
+	kms = get_kms(crtc);
+	catalog = kms->catalog;
+
+	version = catalog->dspp[0].sblk->dither.version >> 16;
+	snprintf(feature_name, ARRAY_SIZE(feature_name), "%s%d",
+		"SDE_DSPP_PA_DITHER_V", version);
+	switch (version) {
+	case 1:
+		sde_cp_crtc_install_blob_property(crtc, feature_name,
+			SDE_CP_CRTC_DSPP_DITHER,
+			sizeof(struct drm_msm_pa_dither));
+		break;
+	default:
+		DRM_ERROR("version %d not supported\n", version);
+		break;
+	}
+}
+
 static void sde_cp_update_list(struct sde_cp_node *prop_node,
 		struct sde_crtc *crtc, bool dirty_list)
 {
@@ -1506,6 +1604,7 @@ static void sde_cp_update_list(struct sde_cp_node *prop_node,
 	case SDE_CP_CRTC_DSPP_AD_INPUT:
 	case SDE_CP_CRTC_DSPP_AD_ASSERTIVENESS:
 	case SDE_CP_CRTC_DSPP_AD_BACKLIGHT:
+	case SDE_CP_CRTC_DSPP_AD_STRENGTH:
 		if (dirty_list)
 			list_add_tail(&prop_node->dirty_list, &crtc->ad_dirty);
 		else
@@ -1553,6 +1652,9 @@ static int sde_cp_ad_validate_prop(struct sde_cp_node *prop_node,
 			break;
 		case SDE_CP_CRTC_DSPP_AD_BACKLIGHT:
 			ad_prop = AD_BACKLIGHT;
+			break;
+		case SDE_CP_CRTC_DSPP_AD_STRENGTH:
+			ad_prop = AD_STRENGTH;
 			break;
 		default:
 			/* Not an AD property */

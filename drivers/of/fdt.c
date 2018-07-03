@@ -31,14 +31,7 @@
 #include <asm/setup.h>  /* for COMMAND_LINE_SIZE */
 #include <asm/page.h>
 
-
-#include <linux/module.h>
-static unsigned long long ddr_size = 0;
-module_param(ddr_size, ullong, S_IRUGO);
-MODULE_PARM_DESC(ddr_size, "ddr size");
-
-
-void init_param_mem_base_size(phys_addr_t base, unsigned long size);
+#include "of_private.h"
 
 /*
  * of_fdt_limit_memory - limit the number of regions in the /memory node
@@ -1283,6 +1276,8 @@ void __init unflatten_device_tree(void)
 
 	/* Get pointer to "/chosen" and "/aliases" nodes for use everywhere */
 	of_alias_scan(early_init_dt_alloc_memory_arch);
+
+	of_populate_phandle_cache_early();
 }
 
 /**

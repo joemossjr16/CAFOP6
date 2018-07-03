@@ -358,15 +358,14 @@ int pil_mss_shutdown(struct pil_desc *pil)
 									ret);
 	}
 
-	/* CR 2180138 */
 	pil_mss_pdc_sync(drv, true);
 	/* Wait 6 32kHz sleep cycles for PDC SYNC true */
 	udelay(200);
-	pil_mss_restart_reg(drv, true);
+	pil_mss_restart_reg(drv, 1);
 	/* Wait 6 32kHz sleep cycles for reset */
 	udelay(200);
-	ret = pil_mss_restart_reg(drv, false);
-	/* Wait 6 32kHz sleep cycles for PDC SYNC false */
+	ret =  pil_mss_restart_reg(drv, 0);
+	/* Wait 6 32kHz sleep cycles for reset false */
 	udelay(200);
 	pil_mss_pdc_sync(drv, false);
 
@@ -788,6 +787,11 @@ int pil_mss_debug_reset(struct pil_desc *pil)
 
 	if (!pil->minidump)
 		return 0;
+	if (pil->minidump) {
+		if (pil->minidump->md_ss_enable_status != MD_SS_ENABLED)
+			return 0;
+	}
+
 	/*
 	 * Bring subsystem out of reset and enable required
 	 * regulators and clocks.
